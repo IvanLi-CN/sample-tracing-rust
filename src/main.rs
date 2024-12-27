@@ -1,18 +1,18 @@
 use std::io::Error;
 
-use opentelemetry::{global, trace::TracerProvider, Key, KeyValue};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::{global, Key, KeyValue};
+use opentelemetry_otlp::{WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::{
     metrics::{
-        reader::{DefaultAggregationSelector, DefaultTemporalitySelector},
         Aggregation, Instrument, MeterProviderBuilder, PeriodicReader, SdkMeterProvider, Stream,
     },
     runtime,
-    trace::{BatchConfig, RandomIdGenerator, Sampler, Tracer},
+    trace::{RandomIdGenerator, Sampler, Tracer},
     Resource,
 };
 use opentelemetry_semantic_conventions::{
-    resource::{DEPLOYMENT_ENVIRONMENT, SERVICE_NAME, SERVICE_VERSION},
+    resource::{DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_NAME, SERVICE_VERSION},
     SCHEMA_URL,
 };
 use tonic::metadata::*;
@@ -26,7 +26,7 @@ fn resource() -> Resource {
         [
             KeyValue::new(SERVICE_NAME, env!("CARGO_PKG_NAME")),
             KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")),
-            KeyValue::new(DEPLOYMENT_ENVIRONMENT, "develop"),
+            KeyValue::new(DEPLOYMENT_ENVIRONMENT_NAME, "develop"),
         ],
         SCHEMA_URL,
     )
@@ -49,15 +49,12 @@ fn otl_metadata() -> Result<MetadataMap, Error> {
 
 // Construct MeterProvider for MetricsLayer
 fn init_meter_provider() -> SdkMeterProvider {
-    let exporter = opentelemetry_otlp::new_exporter()
-        .tonic()
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
         .with_endpoint("http://localhost:5081/development")
         .with_protocol(opentelemetry_otlp::Protocol::Grpc)
         .with_metadata(otl_metadata().unwrap())
-        .build_metrics_exporter(
-            Box::new(DefaultAggregationSelector::new()),
-            Box::new(DefaultTemporalitySelector::new()),
-        )
+        .build()
         .unwrap();
 
     let reader = PeriodicReader::builder(exporter, runtime::Tokio)
@@ -66,7 +63,7 @@ fn init_meter_provider() -> SdkMeterProvider {
 
     // For debugging in development
     let stdout_reader = PeriodicReader::builder(
-        opentelemetry_stdout::MetricsExporter::default(),
+        opentelemetry_stdout::MetricExporter::default(),
         runtime::Tokio,
     )
     .build();
@@ -115,27 +112,22 @@ fn init_meter_provider() -> SdkMeterProvider {
 
 // Construct Tracer for OpenTelemetryLayer
 fn init_tracer() -> Tracer {
-    let provider = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_trace_config(
-            opentelemetry_sdk::trace::Config::default()
-                // Customize sampling strategy
-                .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
-                    1.0,
-                ))))
-                // If export trace to AWS X-Ray, you can use XrayIdGenerator
-                .with_id_generator(RandomIdGenerator::default())
-                .with_resource(resource()),
-        )
-        .with_batch_config(BatchConfig::default())
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint("http://localhost:5081/development")
-                .with_metadata(otl_metadata().unwrap()),
-        )
-        .install_batch(runtime::Tokio)
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint("http://localhost:5081/development")
+        .with_metadata(otl_metadata().unwrap())
+        .build()
         .unwrap();
+
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+            1.0,
+        ))))
+        // If export trace to AWS X-Ray, you can use XrayIdGenerator
+        .with_id_generator(RandomIdGenerator::default())
+        .with_resource(resource())
+        .with_batch_exporter(exporter, runtime::Tokio)
+        .build();
 
     global::set_tracer_provider(provider.clone());
     provider.tracer("tracing-otel-subscriber")
